@@ -3,7 +3,12 @@ import json
 import os
 import uuid
 from urllib.parse import urlparse, parse_qs
-from auth_helper import get_bearer_token  # Import your new auth logic
+from auth_helper import get_bearer_token
+
+# --- CONFIGURATION ---
+# Set to True to enable every group found on the account
+# Set to False to only enable groups listed in TARGET_GROUPS
+ENABLE_ALL = True 
 
 TARGET_GROUPS = [
     "Main Events / PPV", "US - Entertainment", "US - Movies", 
@@ -14,7 +19,6 @@ TARGET_GROUPS = [
 ]
 
 def run_iptv_replication(mgmt_url, token, iptv_url):
-    # 1. Parse URL and Extract Credentials
     parsed_url = urlparse(iptv_url)
     base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     params = parse_qs(parsed_url.query)
@@ -22,7 +26,6 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     username = params.get('username', [None])[0]
     password = params.get('password', [None])[0]
 
-    # --- UUID GENERATION ---
     unique_id = str(uuid.uuid4())[:8]
     account_name = f"IPTV_{unique_id}"
 
@@ -32,13 +35,13 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
 
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # 2. Step 1: Create the M3U Account
+    # 1. Create the M3U Account
     create_payload = {
         "name": account_name,
         "server_url": base_url,
         "user_agent": None,
         "is_active": True,
-        "max_streams": 0,
+        "max_streams": 1,
         "refresh_interval": 24,
         "account_type": "XC",
         "username": username,
@@ -58,7 +61,7 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     account_id = create_resp.json().get('id')
     print(f"  - Account Created. ID: {account_id}")
 
-    # 3. Step 2: Configure Auto-Enable Settings
+    # 2. Configure Auto-Enable Settings
     settings_payload = {
         "auto_enable_new_groups_live": True,
         "auto_enable_new_groups_vod": True,
@@ -66,7 +69,7 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     }
     requests.patch(f"{mgmt_url}/api/m3u/accounts/{account_id}/", headers=headers, json=settings_payload)
 
-    # 4. Step 3: Apply Specific Group Filtering
+    # 3. Apply Group Filtering Logic
     print("  - Fetching group lists and mapping IDs...")
     all_groups_resp = requests.get(f"{mgmt_url}/api/channels/groups/", headers=headers).json()
     group_lookup = {g['name']: g['id'] for g in all_groups_resp if 'name' in g}
@@ -77,7 +80,14 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     group_settings = []
     for g in available_groups:
         current_id = g['channel_group']
-        is_enabled = any(group_lookup.get(target) == current_id for target in TARGET_GROUPS)
+        
+        # New Flag Logic: If ENABLE_ALL is true, every group is enabled.
+        # Otherwise, check against the TARGET_GROUPS list.
+        if ENABLE_ALL:
+            is_enabled = True
+        else:
+            # Check against the TARGET_GROUPS list
+            is_enabled = any(group_lookup.get(target_name) == current_id for target_name in TARGET_GROUPS)
         
         group_settings.append({
             "channel_group": current_id,
@@ -85,14 +95,14 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
         })
 
     if group_settings:
-        print(f"  - Updating group selections ({len(group_settings)} groups)...")
+        print(f"  - Updating group selections (Enable All: {ENABLE_ALL})...")
         requests.patch(
             f"{mgmt_url}/api/m3u/accounts/{account_id}/group-settings/", 
             headers=headers, 
             json={"group_settings": group_settings}
         )
 
-    # 5. Step 4: Create EPG Source
+    # 4. Create EPG Source
     epg_url = f"{base_url}/xmltv.php?username={username}&password={password}"
     epg_payload = {
         "name": f"{account_name}_EPG",
@@ -104,7 +114,7 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     print(f"  - Registering EPG source: {epg_payload['name']}...")
     requests.post(f"{mgmt_url}/api/epg/sources/", headers=headers, json=epg_payload)
 
-    # 6. Step 5: Trigger Account Refresh
+    # 5. Trigger Account Refresh
     print(f"  - Refreshing account {account_id}...")
     refresh_resp = requests.post(f"{mgmt_url}/api/m3u/refresh/{account_id}/", headers=headers)
     if refresh_resp.status_code == 202:
@@ -113,10 +123,10 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
         print(f"  - Refresh failed: {refresh_resp.text}")
 
 if __name__ == "__main__":
-    # Get dynamic token using your new auth helper
     print("Authenticating with management server...")
     current_token = get_bearer_token()
-    base_url = os.getenv("BASE_URL")
+    # Ensure management server URL is pulled from environment or defined
+    base_mgmt_url = os.getenv("BASE_URL") or "http://khangserver:9191"
 
     if not current_token:
         print("Critical Error: Could not retrieve authentication token. Exiting.")
@@ -128,12 +138,12 @@ if __name__ == "__main__":
             with open(file_path, "r") as f:
                 urls = [line.strip() for line in f if line.strip()]
             
-            print(f"Found {len(urls)} URLs to process.")
+            print(f"Found {len(urls)} URLs to process. Global Enable All: {ENABLE_ALL}")
             
             for index, url in enumerate(urls, start=1):
                 print(f"\n--- Processing URL {index}/{len(urls)} ---")
                 try:
-                    run_iptv_replication(base_url, current_token, url)
+                    run_iptv_replication(base_mgmt_url, current_token, url)
                 except Exception as e:
                     print(f"  - Failed to process URL: {e}")
             
