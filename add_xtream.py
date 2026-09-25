@@ -1,24 +1,26 @@
-import requests
-import json
 import os
 import uuid
 from urllib.parse import urlparse, parse_qs
 from auth_helper import get_bearer_token
 
+# Import our shared logic engine
+from iptv_utils import (
+    get_robust_session, 
+    load_list_from_file, 
+    is_group_enabled, 
+    WHITELIST_FILE, 
+    BLACKLIST_FILE
+)
+
 # --- CONFIGURATION ---
-# Set to True to enable every group found on the account
-# Set to False to only enable groups listed in TARGET_GROUPS
+# Set to True to enable every group found on the account (except blacklisted items)
+# Set to False to respect your whitelist.txt entries
 ENABLE_ALL = True 
 
-TARGET_GROUPS = [
-    "Main Events / PPV", "US - Entertainment", "US - Movies", 
-    "US - Sports", "FanDuel Sports", "SuperSports", 
-    "NHL", "NHL.2", "Canada", "DAZN", "PARAMOUNT", "PPV", 
-    "SPORTS EXCLUSIVE", "USA SPORTS", "Default Group", "4K", 
-    "DISCOVERY +", "HBO MAX", "PEACOCK", "ESPN"
-]
+# Maximum number of URLs permitted per individual domain/host
+MAX_URLS_PER_HOST = 50
 
-def run_iptv_replication(mgmt_url, token, iptv_url):
+def run_iptv_replication(session, mgmt_url, iptv_url, whitelist, blacklist):
     parsed_url = urlparse(iptv_url)
     base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     params = parse_qs(parsed_url.query)
@@ -32,8 +34,6 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     if not username or not password:
         print("  - Error: URL missing credentials.")
         return
-
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
     # 1. Create the M3U Account
     create_payload = {
@@ -52,7 +52,7 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
     }
 
     print(f"  - Creating account: {account_name}...")
-    create_resp = requests.post(f"{mgmt_url}/api/m3u/accounts/", headers=headers, json=create_payload)
+    create_resp = session.post(f"{mgmt_url}/api/m3u/accounts/", json=create_payload)
     
     if create_resp.status_code not in [200, 201]:
         print(f"  - Failed to create account: {create_resp.status_code}")
@@ -67,27 +67,23 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
         "auto_enable_new_groups_vod": True,
         "auto_enable_new_groups_series": True
     }
-    requests.patch(f"{mgmt_url}/api/m3u/accounts/{account_id}/", headers=headers, json=settings_payload)
+    session.patch(f"{mgmt_url}/api/m3u/accounts/{account_id}/", json=settings_payload)
 
-    # 3. Apply Group Filtering Logic
+    # 3. Apply Centralized Group Filtering Logic
     print("  - Fetching group lists and mapping IDs...")
-    all_groups_resp = requests.get(f"{mgmt_url}/api/channels/groups/", headers=headers).json()
-    group_lookup = {g['name']: g['id'] for g in all_groups_resp if 'name' in g}
+    all_groups_resp = session.get(f"{mgmt_url}/api/channels/groups/").json()
+    id_to_name_lookup = {g['id']: g['name'] for g in all_groups_resp if 'id' in g and 'name' in g}
 
-    acc_info = requests.get(f"{mgmt_url}/api/m3u/accounts/{account_id}/", headers=headers).json()
+    acc_info = session.get(f"{mgmt_url}/api/m3u/accounts/{account_id}/").json()
     available_groups = acc_info.get('channel_groups', [])
     
     group_settings = []
     for g in available_groups:
         current_id = g['channel_group']
+        current_name = id_to_name_lookup.get(current_id, "")
         
-        # New Flag Logic: If ENABLE_ALL is true, every group is enabled.
-        # Otherwise, check against the TARGET_GROUPS list.
-        if ENABLE_ALL:
-            is_enabled = True
-        else:
-            # Check against the TARGET_GROUPS list
-            is_enabled = any(group_lookup.get(target_name) == current_id for target_name in TARGET_GROUPS)
+        # Evaluate group visibility using unified utility rules
+        is_enabled = is_group_enabled(current_name, whitelist, blacklist, ENABLE_ALL)
         
         group_settings.append({
             "channel_group": current_id,
@@ -95,10 +91,9 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
         })
 
     if group_settings:
-        print(f"  - Updating group selections (Enable All: {ENABLE_ALL})...")
-        requests.patch(
+        print(f"  - Updating group selections (Enable All Override: {ENABLE_ALL})...")
+        session.patch(
             f"{mgmt_url}/api/m3u/accounts/{account_id}/group-settings/", 
-            headers=headers, 
             json={"group_settings": group_settings}
         )
 
@@ -112,12 +107,12 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
         "refresh_interval": 24
     }
     print(f"  - Registering EPG source: {epg_payload['name']}...")
-    requests.post(f"{mgmt_url}/api/epg/sources/", headers=headers, json=epg_payload)
+    session.post(f"{mgmt_url}/api/epg/sources/", json=epg_payload)
 
     # 5. Trigger Account Refresh
     print(f"  - Refreshing account {account_id}...")
-    refresh_resp = requests.post(f"{mgmt_url}/api/m3u/refresh/{account_id}/", headers=headers)
-    if refresh_resp.status_code == 202:
+    refresh_resp = session.post(f"{mgmt_url}/api/m3u/refresh/{account_id}/")
+    if refresh_resp.status_code in [200, 201, 202, 204]:
         print(f"  - Flow Replicated Successfully for {account_name}.")
     else:
         print(f"  - Refresh failed: {refresh_resp.text}")
@@ -125,12 +120,18 @@ def run_iptv_replication(mgmt_url, token, iptv_url):
 if __name__ == "__main__":
     print("Authenticating with management server...")
     current_token = get_bearer_token()
-    # Ensure management server URL is pulled from environment or defined
     base_mgmt_url = os.getenv("BASE_URL") or "http://khangserver:9191"
 
     if not current_token:
         print("Critical Error: Could not retrieve authentication token. Exiting.")
     else:
+        # Load parsing rules once globally from the text documents
+        whitelist = load_list_from_file(WHITELIST_FILE)
+        blacklist = load_list_from_file(BLACKLIST_FILE)
+        
+        # Establish our unified, robust network session wrapper
+        session = get_robust_session(current_token)
+        
         file_path = "url.txt"
         if not os.path.exists(file_path):
             print(f"Error: {file_path} not found.")
@@ -138,13 +139,34 @@ if __name__ == "__main__":
             with open(file_path, "r") as f:
                 urls = [line.strip() for line in f if line.strip()]
             
-            print(f"Found {len(urls)} URLs to process. Global Enable All: {ENABLE_ALL}")
+            print(f"Found {len(urls)} total URLs in file. Global Enable All: {ENABLE_ALL}")
+            
+            # Tracker dictionary to count how many URLs we've processed per unique domain
+            host_counts = {}
             
             for index, url in enumerate(urls, start=1):
                 print(f"\n--- Processing URL {index}/{len(urls)} ---")
                 try:
-                    run_iptv_replication(base_mgmt_url, current_token, url)
+                    # Parse out the host/domain name (e.g., 'providerdomain.com:8080')
+                    parsed_url = urlparse(url)
+                    host = parsed_url.netloc
+                    
+                    if not host:
+                        print("  - Skipped: Invalid URL structure (could not parse domain).")
+                        continue
+                    
+                    # Track host count incrementation
+                    host_counts[host] = host_counts.get(host, 0) + 1
+                    
+                    # If this host has crossed our threshold constraint, ignore it
+                    if host_counts[host] > MAX_URLS_PER_HOST:
+                        print(f"  - Skipped: Host '{host}' has already processed {MAX_URLS_PER_HOST} accounts.")
+                        continue
+                    
+                    # Pass the session and text lists through to execution loop
+                    run_iptv_replication(session, base_mgmt_url, url, whitelist, blacklist)
+                    
                 except Exception as e:
-                    print(f"  - Failed to process URL: {e}")
+                    print(f"  - Failed to process URL due to unexpected error: {e}")
             
             print("\nAll tasks completed.")
