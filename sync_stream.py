@@ -50,61 +50,35 @@ def sync_channels():
         clean_name = channel_name.replace('\n', '').replace('\r', '').strip()
         existing_ids = [s['id'] for s in channel.get('streams', [])]
         
-        # 1. Parse out the Region prefix if it exists
-        region_match = re.match(r"^([A-Za-z0-9]{2,4})\s*[:|]\s*(.*)$", clean_name)
-        
-        if region_match:
-            region = region_match.group(1)
-            base_name = region_match.group(2).strip()
-        else:
-            region = None
-            base_name = clean_name
-
-        # 2. Strip out any existing quality flags to get a completely raw name
-        pure_base_name = re.sub(r'\b(4K|FHD|HD)\b', '', base_name, flags=re.I)
+        # 1. Strip out any existing quality flags directly from clean_name
+        pure_base_name = re.sub(r'\b(4K|FHD|HD)\b', '', clean_name, flags=re.I)
         pure_base_name = re.sub(r'\s+', ' ', pure_base_name).strip() # Clean dangling spaces
         
-        print(f"Processing '{clean_name}' (ID: {channel_id}) -> Core Base: '{pure_base_name}'" + (f" [{region}]" if region else ""))
+        print(f"Processing '{clean_name}' (ID: {channel_id}) -> Core Base: '{pure_base_name}'")
 
-        # 3. Search sequentially following your quality tier hierarchy
+        # 2. Search sequentially following your quality tier hierarchy
         qualities = ["4K", "FHD", "HD", ""]
         found_ids = []
         
         for q in qualities:
-            # Build the core name for this specific tier
-            stream_core = f"{pure_base_name} {q}".strip() if q else pure_base_name
+            term = f"{pure_base_name} {q}".strip() if q else pure_base_name
             
-            # Combine the tier name with your regional prefix variations
-            if region:
-                q_terms = [
-                    f"{region}: {stream_core}",
-                    f"{region} | {stream_core}",
-                    f"{region}| {stream_core}",
-                    f"{region}|{stream_core}"
-                ]
-            else:
-                q_terms = [stream_core]
-                
-            q_terms = list(dict.fromkeys(q_terms))
+            encoded_name = urllib.parse.quote(term)
+            search_url = f"{base_url}/api/channels/streams/ids/?name={encoded_name}"
+            search_res = requests.get(search_url, headers=HEADERS)
             
-            # Execute searches for this quality tier
-            for term in q_terms:
-                encoded_name = urllib.parse.quote(term)
-                search_url = f"{base_url}/api/channels/streams/ids/?name={encoded_name}"
-                search_res = requests.get(search_url, headers=HEADERS)
-                
-                if search_res.status_code == 200:
-                    res_ids = search_res.json()
-                    if isinstance(res_ids, list):
-                        found_ids.extend(res_ids)
+            if search_res.status_code == 200:
+                res_ids = search_res.json()
+                if isinstance(res_ids, list):
+                    found_ids.extend(res_ids)
 
-        # 4. Deduplicate found IDs while preserving their strict high-to-low quality order
+        # 3. Deduplicate found IDs while preserving their strict high-to-low quality order
         prioritized_ids = list(dict.fromkeys(found_ids))
         
         # Append any pre-existing stream IDs that the search missed so nothing gets lost
         final_ids = prioritized_ids + [x for x in existing_ids if x not in prioritized_ids]
         
-        # 5. Patch if there are new streams OR if the quality sorting sequence changed
+        # 4. Patch if there are new streams OR if the quality sorting sequence changed
         if final_ids != existing_ids:
             patch_url = f"{base_url}/api/channels/channels/{channel_id}/"
             payload = {"id": channel_id, "streams": final_ids}
